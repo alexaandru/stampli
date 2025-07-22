@@ -151,14 +151,14 @@ func TestGenerateBadge(t *testing.T) {
 	tests := []struct {
 		name        string
 		coverage    float64
-		config      *Config
+		config      *config
 		shouldError bool
 		contains    []string
 	}{
 		{
 			name:     "Basic badge generation",
 			coverage: 75.5,
-			config: &Config{
+			config: &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        simpleTemplate,
@@ -169,7 +169,7 @@ func TestGenerateBadge(t *testing.T) {
 		{
 			name:     "Red badge for low coverage",
 			coverage: 25.0,
-			config: &Config{
+			config: &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        simpleTemplate,
@@ -180,7 +180,7 @@ func TestGenerateBadge(t *testing.T) {
 		{
 			name:     "Yellow badge for medium coverage",
 			coverage: 55.0,
-			config: &Config{
+			config: &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        simpleTemplate,
@@ -191,7 +191,7 @@ func TestGenerateBadge(t *testing.T) {
 		{
 			name:     "Invalid template",
 			coverage: 50.0,
-			config: &Config{
+			config: &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        `<svg>{{.InvalidField}}</svg>`,
@@ -232,7 +232,7 @@ func TestGenerateBadge(t *testing.T) {
 func TestGenerateBadgeWithDefaultTemplate(t *testing.T) {
 	t.Parallel()
 
-	config := &Config{
+	config := &config{
 		RedThreshold:    40.0,
 		YellowThreshold: 70.0,
 		Template:        defaultTemplate,
@@ -260,7 +260,7 @@ func TestGenerateBadgeWithDefaultTemplate(t *testing.T) {
 func TestConfigDefaults(t *testing.T) {
 	t.Parallel()
 
-	config := &Config{
+	config := &config{
 		TestCommand:     "go test ./... -coverprofile=coverage.out",
 		OutputFile:      "coverage-badge.svg",
 		RedThreshold:    40.0,
@@ -335,13 +335,13 @@ github.com/test/example.go:20.5,25.10 3 0`
 
 	tests := []struct {
 		name          string
-		config        *Config
+		config        *config
 		expectError   bool
 		errorContains string
 	}{
 		{
 			name: "Valid configuration - quiet mode",
-			config: &Config{
+			config: &config{
 				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
 				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
 				RedThreshold:    40.0,
@@ -353,7 +353,7 @@ github.com/test/example.go:20.5,25.10 3 0`
 		},
 		{
 			name: "Valid configuration - verbose mode",
-			config: &Config{
+			config: &config{
 				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
 				OutputFile:      filepath.Join(tempDir, "test-badge-verbose.svg"),
 				RedThreshold:    40.0,
@@ -365,7 +365,7 @@ github.com/test/example.go:20.5,25.10 3 0`
 		},
 		{
 			name: "Invalid template file",
-			config: &Config{
+			config: &config{
 				TestCommand:     "echo 'test'",
 				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
 				RedThreshold:    40.0,
@@ -378,7 +378,7 @@ github.com/test/example.go:20.5,25.10 3 0`
 		},
 		{
 			name: "Invalid test command",
-			config: &Config{
+			config: &config{
 				TestCommand:     "",
 				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
 				RedThreshold:    40.0,
@@ -391,7 +391,7 @@ github.com/test/example.go:20.5,25.10 3 0`
 		},
 		{
 			name: "Invalid output directory",
-			config: &Config{
+			config: &config{
 				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
 				OutputFile:      "/invalid/path/badge.svg",
 				RedThreshold:    40.0,
@@ -448,13 +448,13 @@ func TestLoadTemplate(t *testing.T) {
 
 	tests := []struct {
 		name             string
-		config           *Config
+		config           *config
 		expectError      bool
 		expectedTemplate string
 	}{
 		{
 			name: "Load from file",
-			config: &Config{
+			config: &config{
 				Template: testTemplateFile,
 			},
 			expectError:      false,
@@ -462,7 +462,7 @@ func TestLoadTemplate(t *testing.T) {
 		},
 		{
 			name: "Use default template",
-			config: &Config{
+			config: &config{
 				Template: "",
 			},
 			expectError:      false,
@@ -470,14 +470,14 @@ func TestLoadTemplate(t *testing.T) {
 		},
 		{
 			name: "Nonexistent file",
-			config: &Config{
+			config: &config{
 				Template: "/nonexistent/file.svg",
 			},
 			expectError: true,
 		},
 		{
 			name: "Empty filename",
-			config: &Config{
+			config: &config{
 				Template: "",
 			},
 			expectError:      false,
@@ -603,7 +603,7 @@ github.com/test/main.go:20.5,25.10 4 1`
 		t.Fatalf("Failed to create coverage file: %v", err)
 	}
 
-	config := &Config{
+	config := &config{
 		TestCommand:     "echo 'test completed' -coverprofile=" + coverageFile,
 		OutputFile:      filepath.Join(tempDir, "main-test-badge.svg"),
 		RedThreshold:    40.0,
@@ -651,7 +651,7 @@ func BenchmarkRunApplication(b *testing.B) {
 github.com/test/main.go:10.5,15.10 10 1`
 	os.WriteFile(coverageFile, []byte(coverageContent), 0o644)
 
-	config := &Config{
+	config := &config{
 		TestCommand:     "echo 'test' -coverprofile=" + coverageFile,
 		OutputFile:      filepath.Join(tempDir, "bench-badge.svg"),
 		RedThreshold:    40.0,
@@ -673,12 +673,12 @@ func TestConfigurationEdgeCases(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		config *Config
+		config *config
 		valid  bool
 	}{
 		{
 			name: "Zero thresholds",
-			config: &Config{
+			config: &config{
 				RedThreshold:    0,
 				YellowThreshold: 0,
 			},
@@ -686,7 +686,7 @@ func TestConfigurationEdgeCases(t *testing.T) {
 		},
 		{
 			name: "Negative thresholds",
-			config: &Config{
+			config: &config{
 				RedThreshold:    -10,
 				YellowThreshold: -5,
 			},
@@ -694,7 +694,7 @@ func TestConfigurationEdgeCases(t *testing.T) {
 		},
 		{
 			name: "Very high thresholds",
-			config: &Config{
+			config: &config{
 				RedThreshold:    150,
 				YellowThreshold: 200,
 			},
@@ -702,7 +702,7 @@ func TestConfigurationEdgeCases(t *testing.T) {
 		},
 		{
 			name: "Red higher than yellow",
-			config: &Config{
+			config: &config{
 				RedThreshold:    80,
 				YellowThreshold: 50,
 			},
@@ -934,7 +934,7 @@ func TestGenerateBadgeTemplateErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			config := &Config{
+			config := &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        tt.template,
@@ -988,7 +988,7 @@ func TestWriteBadgeFilePermissions(t *testing.T) {
 }
 
 func BenchmarkLoadTemplate(b *testing.B) {
-	config := &Config{
+	config := &config{
 		Template: "", // Use default template
 	}
 
@@ -1014,7 +1014,7 @@ func BenchmarkWriteBadgeFile(b *testing.B) {
 }
 
 func BenchmarkGenerateBadge(b *testing.B) {
-	config := &Config{
+	config := &config{
 		RedThreshold:    40.0,
 		YellowThreshold: 70.0,
 		Template:        defaultTemplate,
@@ -1161,7 +1161,7 @@ example.go:30.5,35.10 3 1`
 		t.Fatalf("Failed to parse coverage: %v", err)
 	}
 
-	config := &Config{
+	config := &config{
 		RedThreshold:    40.0,
 		YellowThreshold: 70.0,
 		Template:        defaultTemplate,
@@ -1258,7 +1258,7 @@ test.go:20.5,25.10 2 1`,
 			}
 
 			// Generate badge
-			config := &Config{
+			config := &config{
 				RedThreshold:    40.0,
 				YellowThreshold: 70.0,
 				Template:        defaultTemplate,

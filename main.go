@@ -15,7 +15,7 @@ import (
 	"text/template"
 )
 
-type Config struct {
+type config struct {
 	TestCommand     string
 	OutputFile      string
 	Template        string
@@ -29,38 +29,30 @@ type Config struct {
 //go:embed coverage-template.svg
 var defaultTemplate string
 
-func main() {
-	//nolint:mnd // ok
-	config := &Config{
-		TestCommand:     "go test ./... -coverprofile=coverage.out",
-		OutputFile:      "coverage-badge.svg",
-		RedThreshold:    50.0,
-		YellowThreshold: 75.0,
-		AutoClean:       true,
-	}
+//nolint:gochecknoglobals,mnd // ok
+var cfg = &config{
+	TestCommand:     "go test ./... -coverprofile=coverage.out",
+	OutputFile:      "coverage-badge.svg",
+	RedThreshold:    50.0,
+	YellowThreshold: 80.0,
+	AutoClean:       true,
+}
 
-	flag.StringVar(&config.TestCommand, "command", config.TestCommand, "Command to run tests and generate coverage")
-	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "Output SVG file path")
-	flag.Float64Var(&config.RedThreshold, "red", config.RedThreshold, "Red threshold (coverage below this is red)")
-	flag.Float64Var(&config.YellowThreshold, "yellow", config.YellowThreshold, "Yellow threshold (coverage below this is yellow)")
-	flag.StringVar(&config.Template, "template", config.Template, "Path to custom SVG template file (optional)")
-	flag.BoolVar(&config.DumpTemplate, "dump-template", config.DumpTemplate, "Dump the default SVG template to stdout and exit")
-	flag.BoolVar(&config.Quiet, "quiet", false, "Suppress output messages (only errors will be printed)")
-	flag.BoolVar(&config.AutoClean, "auto-clean", config.AutoClean, "Automatically clean up coverage files after generating the badge")
+func main() {
 	flag.Parse()
 
-	if config.DumpTemplate {
+	if cfg.DumpTemplate {
 		fmt.Print(defaultTemplate) //nolint:forbidigo // ok
 		return
 	}
 
-	if err := runApplication(config); err != nil {
+	if err := runApplication(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runApplication(config *Config) error {
+func runApplication(config *config) error {
 	if err := loadTemplate(config); err != nil {
 		return err
 	}
@@ -86,7 +78,7 @@ func runApplication(config *Config) error {
 	return nil
 }
 
-func loadTemplate(config *Config) error {
+func loadTemplate(config *config) error {
 	if config.Template != "" {
 		data, err := os.ReadFile(config.Template)
 		if err != nil {
@@ -188,7 +180,7 @@ func parseCoverageFile(filename string) (float64, error) {
 	return (float64(coveredStatements) / float64(totalStatements)) * 100, nil //nolint:mnd // ok
 }
 
-func generateBadge(coverage float64, config *Config) (string, error) {
+func generateBadge(coverage float64, config *config) (string, error) {
 	color := getColor(coverage, config.RedThreshold, config.YellowThreshold)
 
 	data := struct {
@@ -221,4 +213,15 @@ func getColor(coverage, redThreshold, yellowThreshold float64) string {
 	default:
 		return "#44cc11"
 	}
+}
+
+func init() {
+	flag.StringVar(&cfg.TestCommand, "command", cfg.TestCommand, "Command to run tests and generate coverage")
+	flag.StringVar(&cfg.OutputFile, "output", cfg.OutputFile, "Output SVG file path")
+	flag.Float64Var(&cfg.RedThreshold, "red", cfg.RedThreshold, "Red threshold (coverage below this is red)")
+	flag.Float64Var(&cfg.YellowThreshold, "yellow", cfg.YellowThreshold, "Yellow threshold (coverage below this is yellow)")
+	flag.StringVar(&cfg.Template, "template", cfg.Template, "Path to custom SVG template file (optional)")
+	flag.BoolVar(&cfg.DumpTemplate, "dump-template", cfg.DumpTemplate, "Dump the default SVG template to stdout and exit")
+	flag.BoolVar(&cfg.Quiet, "quiet", false, "Suppress output messages (only errors will be printed)")
+	flag.BoolVar(&cfg.AutoClean, "auto-clean", cfg.AutoClean, "Automatically clean up coverage files after generating the badge")
 }
