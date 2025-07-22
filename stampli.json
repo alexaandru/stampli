@@ -1,0 +1,7 @@
+{
+  "testCommand": "go test ./... -coverprofile=coverage.out",
+  "outputFile": "coverage-badge.svg",
+  "levels": "85=#44cc11,70=#dfb317,50=#ff8c00,=#ff0001",
+  "autoClean": true,
+  "quiet": false
+}

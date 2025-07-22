@@ -1,42 +1,911 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"text/template"
 )
 
-func TestGetColor(t *testing.T) {
+func TestConfigMerge(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		coverage        float64
-		redThreshold    float64
-		yellowThreshold float64
-		expectedColor   string
+		name      string
+		base      *config
+		other     *config
+		expected  *config
+		wantError bool
 	}{
-		{"Low coverage - red", 30.0, 40.0, 70.0, "#e05d44"},
-		{"Medium coverage - yellow", 50.0, 40.0, 70.0, "#dfb317"},
-		{"High coverage - green", 80.0, 40.0, 70.0, "#44cc11"},
-		{"Exactly at red threshold", 40.0, 40.0, 70.0, "#dfb317"},
-		{"Exactly at yellow threshold", 70.0, 40.0, 70.0, "#44cc11"},
-		{"Zero coverage", 0.0, 40.0, 70.0, "#e05d44"},
-		{"Perfect coverage", 100.0, 40.0, 70.0, "#44cc11"},
-		{"Custom thresholds", 45.0, 30.0, 60.0, "#dfb317"},
+		{
+			name:     "Empty configs",
+			base:     &config{},
+			other:    &config{},
+			expected: &config{},
+		},
+		{
+			name: "Merge non-empty into empty",
+			base: &config{},
+			other: &config{
+				TestCommand: "go test",
+				OutputFile:  "badge.svg",
+				Quiet:       true,
+			},
+			expected: &config{
+				TestCommand: "go test",
+				OutputFile:  "badge.svg",
+				Quiet:       true,
+			},
+		},
+		{
+			name: "Merge into existing config",
+			base: &config{
+				TestCommand:  "original",
+				OutputFile:   "original.svg",
+				Quiet:        false,
+				DumpTemplate: false,
+			},
+			other: &config{
+				TestCommand: "go test",
+				Quiet:       true,
+			},
+			expected: &config{
+				TestCommand:  "go test",
+				OutputFile:   "", // JSON marshal/unmarshal overwrites with zero value
+				Quiet:        true,
+				DumpTemplate: false, // JSON marshal/unmarshal overwrites with zero value
+			},
+		},
+		{
+			name: "Merge levels",
+			base: &config{
+				Levels: Levels{90.0: "#00ff00"},
+			},
+			other: &config{
+				Levels: Levels{70.0: "#ffff00", 0.0: "#ff0000"},
+			},
+			expected: &config{
+				Levels: Levels{70.0: "#ffff00", 0.0: "#ff0000"},
+			},
+		},
+		{
+			name: "JSON roundtrip test",
+			base: &config{
+				TestCommand:  "go test",
+				OutputFile:   "badge.svg",
+				Quiet:        true,
+				AutoClean:    false,
+				DumpTemplate: true,
+				Levels:       Levels{90.0: "#00ff00", 0.0: "#ff0000"},
+			},
+			other: &config{
+				TestCommand: "new command",
+				Quiet:       false,
+				AutoClean:   true,
+			},
+			expected: &config{
+				TestCommand:  "new command",
+				OutputFile:   "", // JSON marshal/unmarshal overwrites with zero value
+				Quiet:        false,
+				AutoClean:    true,
+				DumpTemplate: false,    // JSON marshal/unmarshal overwrites with zero value
+				Levels:       Levels{}, // JSON marshal/unmarshal overwrites with zero value
+			},
+		},
+		{
+			name: "Merge with CoveragePC set",
+			base: &config{
+				TestCommand: "original",
+				OutputFile:  "original.svg",
+			},
+			other: &config{
+				TestCommand: "new command",
+				CoveragePC:  func() *float64 { v := 85.5; return &v }(),
+			},
+			expected: &config{
+				TestCommand: "new command",
+				OutputFile:  "", // JSON marshal/unmarshal overwrites with zero value
+				CoveragePC:  func() *float64 { v := 85.5; return &v }(),
+			},
+		},
+		{
+			name: "Merge with nil CoveragePC",
+			base: &config{
+				TestCommand: "original",
+				CoveragePC:  func() *float64 { v := 90.0; return &v }(),
+			},
+			other: &config{
+				TestCommand: "new command",
+				CoveragePC:  nil,
+			},
+			expected: &config{
+				TestCommand: "new command",
+				OutputFile:  "",                                         // JSON marshal/unmarshal overwrites with zero value
+				CoveragePC:  func() *float64 { v := 90.0; return &v }(), // Should keep base value since other is nil
+			},
+		},
+		{
+			name: "Merge overwriting CoveragePC",
+			base: &config{
+				TestCommand: "original",
+				CoveragePC:  func() *float64 { v := 90.0; return &v }(),
+			},
+			other: &config{
+				TestCommand: "new command",
+				CoveragePC:  func() *float64 { v := 75.2; return &v }(),
+			},
+			expected: &config{
+				TestCommand: "new command",
+				OutputFile:  "", // JSON marshal/unmarshal overwrites with zero value
+				CoveragePC:  func() *float64 { v := 75.2; return &v }(),
+			},
+		},
+		{
+			name: "Merge with invalid levels causing unmarshal error",
+			base: &config{
+				TestCommand: "original",
+			},
+			other: &config{
+				TestCommand: "new command",
+				Levels:      Levels{}, // This will be modified to cause unmarshal error
+			},
+			wantError: false, // Even invalid levels won't cause JSON marshal/unmarshal to fail
+			expected: &config{
+				TestCommand: "new command",
+				OutputFile:  "",
+				Levels:      Levels{},
+			},
+		},
+		{
+			name: "Merge with complex levels",
+			base: &config{
+				TestCommand: "original",
+				Levels:      Levels{50.0: "#yellow"},
+			},
+			other: &config{
+				TestCommand: "new command",
+				Levels:      Levels{90.0: "#00ff00", 70.0: "#ffff00", 0.0: "#ff0000"},
+			},
+			expected: &config{
+				TestCommand: "new command",
+				OutputFile:  "",
+				Levels:      Levels{90.0: "#00ff00", 70.0: "#ffff00", 0.0: "#ff0000"},
+			},
+		},
+		{
+			name: "Merge preserving base CoveragePC when other is nil",
+			base: &config{
+				TestCommand: "original",
+				CoveragePC:  func() *float64 { v := 88.8; return &v }(),
+				Quiet:       true,
+			},
+			other: &config{
+				TestCommand: "updated command",
+				Quiet:       false,
+				CoveragePC:  nil, // Explicitly nil
+			},
+			expected: &config{
+				TestCommand: "updated command",
+				OutputFile:  "",
+				Quiet:       false,
+				CoveragePC:  func() *float64 { v := 88.8; return &v }(), // Should preserve base value
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			result := getColor(tt.coverage, tt.redThreshold, tt.yellowThreshold)
-			if result != tt.expectedColor {
-				t.Errorf("getColor(%f, %f, %f) = %s; want %s",
-					tt.coverage, tt.redThreshold, tt.yellowThreshold, result, tt.expectedColor)
+			err := tt.base.merge(tt.other)
+			if tt.wantError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.wantError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.expected != nil { //nolint:nestif // ok
+				if tt.base.TestCommand != tt.expected.TestCommand {
+					t.Errorf("TestCommand = %q, want %q", tt.base.TestCommand, tt.expected.TestCommand)
+				}
+
+				if tt.base.OutputFile != tt.expected.OutputFile {
+					t.Errorf("OutputFile = %q, want %q", tt.base.OutputFile, tt.expected.OutputFile)
+				}
+
+				if tt.base.Quiet != tt.expected.Quiet {
+					t.Errorf("Quiet = %v, want %v", tt.base.Quiet, tt.expected.Quiet)
+				}
+
+				if tt.base.AutoClean != tt.expected.AutoClean {
+					t.Errorf("AutoClean = %v, want %v", tt.base.AutoClean, tt.expected.AutoClean)
+				}
+
+				if tt.base.DumpTemplate != tt.expected.DumpTemplate {
+					t.Errorf("DumpTemplate = %v, want %v", tt.base.DumpTemplate, tt.expected.DumpTemplate)
+				}
+
+				if len(tt.expected.Levels) > 0 && !tt.base.Levels.eq(tt.expected.Levels) {
+					t.Errorf("Levels = %v, want %v", tt.base.Levels, tt.expected.Levels)
+				}
+
+				if tt.expected.CoveragePC != nil {
+					if tt.base.CoveragePC == nil {
+						t.Error("Expected CoveragePC to be set but it was nil")
+					} else if *tt.base.CoveragePC != *tt.expected.CoveragePC {
+						t.Errorf("CoveragePC = %v, want %v", *tt.base.CoveragePC, *tt.expected.CoveragePC)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLoadConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		setupConfig       string
+		setupDefaultFile  string
+		expectError       bool
+		expectedCmd       string
+		expectedOutput    string
+		expectedLevelsLen int
+	}{
+		{
+			name: "Load embedded defaults",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg",
+				"levels": "70=#44cc11,40=#dfb317,0=#ff0001"
+			}`,
+			setupDefaultFile:  "stampli.json",
+			expectedCmd:       "go test ./... -coverprofile=coverage.out",
+			expectedOutput:    "coverage-badge.svg",
+			expectedLevelsLen: 4,
+		},
+		{
+			name:             "Invalid JSON in embedded defaults",
+			setupConfig:      `{invalid json}`,
+			setupDefaultFile: "stampli.json",
+			expectError:      true,
+		},
+		{
+			name: "Load with command line flags",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg",
+				"levels": "70=#44cc11,40=#dfb317,0=#ff0001"
+			}`,
+			setupDefaultFile:  "stampli.json",
+			expectedCmd:       "custom test command",
+			expectedOutput:    "custom-badge.svg",
+			expectedLevelsLen: 4,
+		},
+		{
+			name: "Config file parsing error",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg"
+			}`,
+			setupDefaultFile: "custom-config.json",
+			expectError:      true,
+		},
+		{
+			name: "Load with invalid levels flag",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg",
+				"levels": "70=#44cc11,40=#dfb317,0=#ff0001"
+			}`,
+			setupDefaultFile: "stampli.json",
+			expectError:      true,
+		},
+		{
+			name: "Load with coverage flag",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg"
+			}`,
+			setupDefaultFile:  "stampli.json",
+			expectedCmd:       "go test ./... -coverprofile=coverage.out",
+			expectedOutput:    "coverage-badge.svg",
+			expectedLevelsLen: 4, // Default levels from embedded config
+		},
+		{
+			name: "Non-existent custom config file",
+			setupConfig: `{
+				"testCommand": "go test ./... -coverprofile=coverage.out",
+				"outputFile": "coverage-badge.svg"
+			}`,
+			setupDefaultFile:  "missing-config.json",
+			expectError:       false, // If default config file doesn't exist, it's ignored
+			expectedCmd:       "go test ./... -coverprofile=coverage.out",
+			expectedOutput:    "coverage-badge.svg",
+			expectedLevelsLen: 0, // No levels when config file is missing
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Setup test environment
+			a := app{
+				defaultConfig:     tt.setupConfig,
+				defaultConfigFile: tt.setupDefaultFile,
+			}
+
+			var args []string
+
+			tempDir := t.TempDir()
+
+			// Setup specific test scenarios
+			switch tt.name {
+			case "Load with command line flags":
+				args = []string{
+					"-command", "custom test command",
+					"-output", "custom-badge.svg",
+				}
+			case "Load with invalid levels flag":
+				args = []string{"-levels", "invalid=format"}
+			case "Load with coverage flag":
+				args = []string{"-coverage", "85.5"}
+			case "Config file parsing error":
+				// Create an invalid JSON config file
+				configPath := filepath.Join(tempDir, "custom-config.json")
+
+				err := os.WriteFile(configPath, []byte(`{invalid json}`), 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create test config file: %v", err)
+				}
+
+				a.ConfigFile = configPath
+				a.defaultConfigFile = configPath
+			case "Non-existent custom config file":
+				a.ConfigFile = filepath.Join(tempDir, "missing-config.json")
+				a.defaultConfigFile = filepath.Join(tempDir, "missing-config.json")
+			}
+
+			err := a.loadConfig(flag.NewFlagSet("test", flag.ContinueOnError), args)
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if !tt.expectError {
+				cfg := &a.config
+
+				if tt.expectedCmd != "" && cfg.TestCommand != tt.expectedCmd {
+					t.Errorf("TestCommand = %q, want %q", cfg.TestCommand, tt.expectedCmd)
+				}
+
+				if tt.expectedOutput != "" && cfg.OutputFile != tt.expectedOutput {
+					t.Errorf("OutputFile = %q, want %q", cfg.OutputFile, tt.expectedOutput)
+				}
+
+				if tt.expectedLevelsLen > 0 && len(cfg.Levels) != tt.expectedLevelsLen {
+					t.Errorf("Levels length = %d, want %d", len(cfg.Levels), tt.expectedLevelsLen)
+				}
+			}
+		})
+	}
+}
+
+func TestRunApplication(t *testing.T) {
+	t.Parallel()
+
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get original working directory: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		setupFunc     func(t *testing.T, tempDir string) *config
+		expectError   bool
+		errorContains string
+		validateFunc  func(t *testing.T, tempDir string, config *config)
+	}{
+		{
+			name: "Successful run with valid coverage",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "coverage-valid.out")
+
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					t.Fatalf("Failed to read testdata coverage file: %v", err)
+				}
+
+				err = os.WriteFile(coverageFile, data, 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create coverage file: %v", err)
+				}
+
+				return &config{
+					TestCommand:  "echo 'test completed' -coverprofile=" + coverageFile,
+					OutputFile:   filepath.Join(tempDir, "badge.svg"),
+					Levels:       Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+					Template:     "", // Should use default
+					DumpTemplate: false,
+					Quiet:        true,
+				}
+			},
+			validateFunc: func(t *testing.T, tempDir string, config *config) {
+				t.Helper()
+
+				badgeData, err := os.ReadFile(config.OutputFile)
+				if err != nil {
+					t.Errorf("Badge file not created: %v", err)
+					return
+				}
+
+				badgeContent := string(badgeData)
+				if !strings.Contains(badgeContent, "<svg") {
+					t.Error("Badge doesn't contain SVG content")
+				}
+
+				if !strings.Contains(badgeContent, "97.4") {
+					t.Error("Badge doesn't contain expected coverage percentage")
+				}
+			},
+		},
+		{
+			name: "Partial coverage scenario",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "partial-test.out")
+
+				// Copy existing testdata coverage file
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					t.Fatalf("Failed to read testdata coverage file: %v", err)
+				}
+
+				err = os.WriteFile(coverageFile, data, 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create coverage file: %v", err)
+				}
+
+				return &config{
+					TestCommand:  "echo 'test' -coverprofile=" + coverageFile,
+					OutputFile:   filepath.Join(tempDir, "badge.svg"),
+					Levels:       Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+					Template:     "", // Use default
+					DumpTemplate: false,
+					Quiet:        true,
+					AutoClean:    false,
+				}
+			},
+			validateFunc: func(t *testing.T, tempDir string, config *config) {
+				t.Helper()
+
+				badgeData, err := os.ReadFile(config.OutputFile)
+				if err != nil {
+					t.Errorf("Badge file not created: %v", err)
+					return
+				}
+
+				badgeContent := string(badgeData)
+				if !strings.Contains(badgeContent, "<svg") {
+					t.Error("Badge doesn't contain SVG content")
+				}
+			},
+		},
+		{
+			name: "Invalid command",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				return &config{
+					TestCommand: "nonexistent-command-12345",
+					OutputFile:  filepath.Join(tempDir, "badge.svg"),
+					Levels:      Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+				}
+			},
+			expectError:   true,
+			errorContains: "error getting coverage",
+		},
+		{
+			name: "Empty command",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				return &config{
+					TestCommand: "",
+					OutputFile:  filepath.Join(tempDir, "badge.svg"),
+					Levels:      Levels{70.0: "#44cc11"},
+				}
+			},
+			expectError:   true,
+			errorContains: "empty command",
+		},
+		{
+			name: "Invalid output directory",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "invalid-dir-test.out")
+
+				// Copy existing testdata coverage file
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					t.Fatalf("Failed to read testdata coverage file: %v", err)
+				}
+
+				err = os.WriteFile(coverageFile, data, 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create coverage file: %v", err)
+				}
+
+				return &config{
+					TestCommand: "echo 'test' -coverprofile=" + coverageFile,
+					OutputFile:  "/nonexistent/directory/badge.svg",
+					Levels:      Levels{70.0: "#44cc11"},
+					Quiet:       true,
+				}
+			},
+			expectError:   true,
+			errorContains: "error writing badge file",
+		},
+
+		{
+			name: "Run with direct coverage percentage",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				coverage := 82.5
+
+				return &config{
+					CoveragePC: &coverage,
+					OutputFile: filepath.Join(tempDir, "badge.svg"),
+					Levels:     Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+					Template:   "", // Use default
+				}
+			},
+			validateFunc: func(t *testing.T, tempDir string, config *config) {
+				t.Helper()
+
+				badgeData, err := os.ReadFile(config.OutputFile)
+				if err != nil {
+					t.Errorf("Badge file not created: %v", err)
+					return
+				}
+
+				badgeContent := string(badgeData)
+				if !strings.Contains(badgeContent, "<svg") {
+					t.Error("Badge doesn't contain SVG content")
+				}
+
+				if !strings.Contains(badgeContent, "82.5") {
+					t.Error("Badge doesn't contain expected coverage percentage")
+				}
+			},
+		},
+		{
+			name: "Template loading error",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				coverage := 75.0
+
+				return &config{
+					CoveragePC: &coverage,
+					OutputFile: filepath.Join(tempDir, "badge.svg"),
+					Template:   "/nonexistent/template.svg",
+					Levels:     Levels{70.0: "#44cc11"},
+				}
+			},
+			expectError:   true,
+			errorContains: "could not read template file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tempDir := t.TempDir()
+
+			a := app{config: *tt.setupFunc(t, tempDir)}
+			err := a.run()
+
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.expectError && tt.errorContains != "" {
+				if !strings.Contains(err.Error(), tt.errorContains) {
+					t.Errorf("Error should contain %q, got %q", tt.errorContains, err.Error())
+				}
+			}
+
+			if tt.validateFunc != nil {
+				tt.validateFunc(t, tempDir, &a.config)
+			}
+		})
+	}
+}
+
+func TestLoadTemplate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		setupFunc        func(t *testing.T, tempDir string) *config
+		expectError      bool
+		expectedTemplate string
+	}{
+		{
+			name: "Load custom template file",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				testTemplateFile := filepath.Join(tempDir, "test-template.svg")
+				testTemplateContent := `<svg><text>{{.Coverage}}% test</text></svg>`
+
+				err := os.WriteFile(testTemplateFile, []byte(testTemplateContent), 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create test template: %v", err)
+				}
+
+				return &config{Template: testTemplateFile}
+			},
+			expectedTemplate: `<svg><text>{{.Coverage}}% test</text></svg>`,
+		},
+		{
+			name: "Use default template when no custom template",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				return &config{Template: ""}
+			},
+			expectedTemplate: defaultTemplate,
+		},
+		{
+			name: "Error loading non-existent template file",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				return &config{Template: filepath.Join(tempDir, "nonexistent-template.svg")}
+			},
+			expectError: true,
+		},
+		{
+			name: "Load template from directory without read permissions",
+			setupFunc: func(t *testing.T, tempDir string) *config {
+				t.Helper()
+
+				if os.Geteuid() == 0 {
+					t.Skip("Skipping permission test when running as root")
+				}
+
+				restrictedDir := filepath.Join(tempDir, "restricted")
+				err := os.Mkdir(restrictedDir, 0o000)
+				if err != nil {
+					t.Fatalf("Failed to create restricted directory: %v", err)
+				}
+
+				return &config{Template: filepath.Join(restrictedDir, "template.svg")}
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tempDir := t.TempDir()
+			a := app{config: *tt.setupFunc(t, tempDir)}
+
+			err := a.loadTemplate()
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if !tt.expectError && tt.expectedTemplate != "" {
+				if a.Template != tt.expectedTemplate {
+					t.Errorf("Template content = %q, want %q", a.Template, tt.expectedTemplate)
+				}
+			}
+		})
+	}
+}
+
+func TestRunTestsAndGetCoverage(t *testing.T) {
+	t.Parallel()
+
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Failed to get original working directory: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		command       string
+		autoClean     bool
+		setupFunc     func(t *testing.T, tempDir string) error
+		expectError   bool
+		expectedRange []float64 // [min, max]
+	}{
+		{
+			name:    "Command with single word",
+			command: "echo",
+			setupFunc: func(t *testing.T, tempDir string) error {
+				t.Helper()
+
+				return os.WriteFile("coverage.out", []byte("mode: set\n"), 0o644)
+			},
+		},
+		{
+			name:        "Empty command",
+			command:     "",
+			expectError: true,
+		},
+		{
+			name:        "Command that fails",
+			command:     "false",
+			expectError: true,
+		},
+		{
+			name:    "Command with coverage file extraction",
+			command: func() string { return "" }(), // Will be set in setupFunc
+			setupFunc: func(t *testing.T, tempDir string) error {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "custom.out")
+
+				// Copy existing testdata coverage file
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read testdata coverage file: %w", err)
+				}
+
+				return os.WriteFile(coverageFile, data, 0o644)
+			},
+			expectedRange: []float64{95.0, 99.0}, // Using testdata coverage which is ~97%
+		},
+		{
+			name:      "Auto clean coverage file",
+			command:   func() string { return "" }(), // Will be set in setupFunc
+			autoClean: true,
+			setupFunc: func(t *testing.T, tempDir string) error {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "coverage.out")
+
+				// Copy existing testdata coverage file
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read testdata coverage file: %w", err)
+				}
+
+				return os.WriteFile(coverageFile, data, 0o644)
+			},
+		},
+		{
+			name:    "Integration test with actual coverage parsing",
+			command: func() string { return "" }(), // Will be set in setupFunc
+			setupFunc: func(t *testing.T, tempDir string) error {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "integration-coverage.out")
+
+				// Copy existing testdata coverage file
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read testdata coverage file: %w", err)
+				}
+
+				return os.WriteFile(coverageFile, data, 0o644)
+			},
+			expectedRange: []float64{95.0, 99.0},
+		},
+		{
+			name:    "Test with sample coverage file",
+			command: func() string { return "" }(), // Will be set in setupFunc
+			setupFunc: func(t *testing.T, tempDir string) error {
+				t.Helper()
+
+				coverageFile := filepath.Join(tempDir, "coverage.out")
+
+				// Copy from testdata
+				sourceFile := filepath.Join(originalWD, "testdata", "coverage-sample.out")
+				data, err := os.ReadFile(sourceFile)
+				if err != nil {
+					return fmt.Errorf("failed to read testdata coverage file: %w", err)
+				}
+
+				return os.WriteFile(coverageFile, data, 0o644)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tempDir := t.TempDir()
+
+			if tt.setupFunc != nil {
+				if err := tt.setupFunc(t, tempDir); err != nil {
+					t.Fatalf("Setup failed: %v", err)
+				}
+			}
+
+			command := tt.command
+			if command == "" {
+				switch {
+				case strings.Contains(tt.name, "coverage file extraction"):
+					command = "echo 'tests passed' -coverprofile=" + filepath.Join(tempDir, "custom.out")
+				case strings.Contains(tt.name, "Integration test"):
+					command = "echo 'tests completed' -coverprofile=" + filepath.Join(tempDir, "integration-coverage.out")
+				case strings.Contains(tt.name, "sample coverage file"):
+					command = "echo 'sample test run' -coverprofile=" + filepath.Join(tempDir, "coverage.out")
+				default:
+					command = "echo 'test' -coverprofile=" + filepath.Join(tempDir, "coverage.out")
+				}
+			}
+
+			a := app{config: config{TestCommand: command, AutoClean: tt.autoClean}}
+
+			coverage, err := a.runTestsAndGetCoverage()
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.expectedRange != nil {
+				if coverage < tt.expectedRange[0] || coverage > tt.expectedRange[1] {
+					t.Errorf("Coverage = %.1f, want between %.1f and %.1f",
+						coverage, tt.expectedRange[0], tt.expectedRange[1])
+				}
+			}
+
+			if tt.autoClean && !tt.expectError {
+				coverageFile := filepath.Join(tempDir, "coverage.out")
+				if _, err := os.Stat(coverageFile); err == nil {
+					t.Error("Expected coverage file to be cleaned up, but it still exists")
+				}
 			}
 		})
 	}
@@ -45,7 +914,6 @@ func TestGetColor(t *testing.T) {
 func TestParseCoverageFile(t *testing.T) {
 	t.Parallel()
 
-	tempDir := t.TempDir()
 	tests := []struct {
 		name        string
 		fileContent string
@@ -53,48 +921,49 @@ func TestParseCoverageFile(t *testing.T) {
 		shouldError bool
 	}{
 		{
-			name: "Valid coverage file with mixed coverage",
-			fileContent: `mode: set
-github.com/user/repo/file1.go:10.5,15.10 3 1
-github.com/user/repo/file1.go:20.5,25.10 2 0
-github.com/user/repo/file2.go:30.5,35.10 4 1`,
-			expected:    77.8, // 7/9 * 100 = 77.777... ≈ 77.8
-			shouldError: false,
-		},
-		{
-			name: "All lines covered",
-			fileContent: `mode: set
-github.com/user/repo/file1.go:10.5,15.10 5 1
-github.com/user/repo/file2.go:20.5,25.10 3 1`,
-			expected:    100.0,
-			shouldError: false,
-		},
-		{
-			name: "No lines covered",
-			fileContent: `mode: set
-github.com/user/repo/file1.go:10.5,15.10 5 0
-github.com/user/repo/file2.go:20.5,25.10 3 0`,
-			expected:    0.0,
-			shouldError: false,
-		},
-		{
-			name:        "Empty coverage file (no statements)",
+			name:        "Empty coverage file (mode only)",
 			fileContent: `mode: set`,
 			expected:    0.0,
-			shouldError: false,
 		},
 		{
-			name:        "Invalid format - no mode line",
-			fileContent: `github.com/user/repo/file1.go:10.5,15.10 5 1`,
-			expected:    0.0,
+			name:        "Invalid file format - no mode line",
+			fileContent: "invalid content without mode line",
 			shouldError: true,
 		},
 		{
-			name: "Single line with coverage",
-			fileContent: `mode: count
-github.com/user/repo/file1.go:10.5,15.10 1 5`,
-			expected:    100.0,
-			shouldError: false,
+			name: "Invalid file format - malformed lines",
+			fileContent: `mode: set
+invalid line format
+malformed data`,
+			shouldError: true,
+		},
+		{
+			name:        "Non-existent file",
+			fileContent: "", // This will be handled by creating a temp file
+			shouldError: true,
+		},
+		{
+			name: "Coverage file with missing total line",
+			fileContent: `mode: set
+github.com/alexaandru/stampli/main.go:55:68,55:73 1 0
+github.com/alexaandru/stampli/main.go:76:2,77:16 1 1`,
+			shouldError: true,
+		},
+		{
+			name: "Coverage file with malformed total line - wrong field count",
+			fileContent: `mode: set
+github.com/alexaandru/stampli/main.go:55:68,55:73 1 0
+github.com/alexaandru/stampli/main.go:76:2,77:16 1 1
+total: statements`,
+			shouldError: true,
+		},
+		{
+			name: "Coverage file with invalid percentage format",
+			fileContent: `mode: set
+github.com/alexaandru/stampli/main.go:55:68,55:73 1 0
+github.com/alexaandru/stampli/main.go:76:2,77:16 1 1
+total:						(statements)		invalid%`,
+			shouldError: true,
 		},
 	}
 
@@ -102,44 +971,41 @@ github.com/user/repo/file1.go:10.5,15.10 1 5`,
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Create temporary file
-			testFile := filepath.Join(tempDir, "coverage-"+strings.ReplaceAll(tt.name, " ", "-")+".out")
+			var (
+				filename string
+				err      error
+			)
 
-			err := os.WriteFile(testFile, []byte(tt.fileContent), 0o644)
-			if err != nil {
-				t.Fatalf("Failed to create test file: %v", err)
-			}
+			if tt.name == "Non-existent file" {
+				filename = "nonexistent-file.out"
+			} else {
+				tempDir := t.TempDir()
+				filename = filepath.Join(tempDir, "coverage.out")
 
-			result, err := parseCoverageFile(testFile)
-
-			if tt.shouldError {
-				if err == nil {
-					t.Errorf("Expected error for %s, but got none", tt.name)
+				err = os.WriteFile(filename, []byte(tt.fileContent), 0o644)
+				if err != nil {
+					t.Fatalf("Failed to create test file: %v", err)
 				}
+			}
 
+			coverage, err := parseCoverageFile(filename)
+
+			if tt.shouldError && err == nil {
+				t.Error("Expected error but got none")
 				return
 			}
 
-			if err != nil {
-				t.Errorf("Unexpected error for %s: %v", tt.name, err)
+			if !tt.shouldError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
 				return
 			}
 
-			// Use a small tolerance for floating point comparison
-			tolerance := 0.1
-			if result < tt.expected-tolerance || result > tt.expected+tolerance {
-				t.Errorf("parseCoverageFile() = %f; want %f (±%f)", result, tt.expected, tolerance)
+			if !tt.shouldError {
+				if abs(coverage-tt.expected) > 0.1 {
+					t.Errorf("Coverage = %.1f, want %.1f", coverage, tt.expected)
+				}
 			}
 		})
-	}
-}
-
-func TestParseCoverageFileNotFound(t *testing.T) {
-	t.Parallel()
-
-	_, err := parseCoverageFile("nonexistent-file.out")
-	if err == nil {
-		t.Error("Expected error when file doesn't exist, but got none")
 	}
 }
 
@@ -156,48 +1022,85 @@ func TestGenerateBadge(t *testing.T) {
 		contains    []string
 	}{
 		{
-			name:     "Basic badge generation",
-			coverage: 75.5,
+			name:     "High coverage with green color",
+			coverage: 85.5,
 			config: &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        simpleTemplate,
+				Template: simpleTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
 			},
-			shouldError: false,
-			contains:    []string{"75.5%", "#44cc11"}, // green color
+			contains: []string{"85.5", "#44cc11"},
 		},
 		{
-			name:     "Red badge for low coverage",
+			name:     "Medium coverage with yellow color",
+			coverage: 55.2,
+			config: &config{
+				Template: simpleTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+			},
+			contains: []string{"55.2", "#dfb317"},
+		},
+		{
+			name:     "Low coverage with red color",
 			coverage: 25.0,
 			config: &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        simpleTemplate,
+				Template: simpleTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
 			},
-			shouldError: false,
-			contains:    []string{"25.0%", "#e05d44"}, // red color
+			contains: []string{"25.0", "#ff0001"},
 		},
 		{
-			name:     "Yellow badge for medium coverage",
-			coverage: 55.0,
+			name:     "Zero coverage",
+			coverage: 0.0,
 			config: &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        simpleTemplate,
+				Template: simpleTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
 			},
-			shouldError: false,
-			contains:    []string{"55.0%", "#dfb317"}, // yellow color
+			contains: []string{"0.0", "#ff0001"},
 		},
 		{
-			name:     "Invalid template",
+			name:     "Perfect coverage",
+			coverage: 100.0,
+			config: &config{
+				Template: simpleTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+			},
+			contains: []string{"100.0", "#44cc11"},
+		},
+		{
+			name:     "Custom template with all variables",
+			coverage: 75.0,
+			config: &config{
+				Template: `<svg><text fill="{{.TextColor}}">{{.Coverage}}%</text><rect fill="{{.Color}}"/></svg>`,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+			},
+			contains: []string{"75.0", "#44cc11"},
+		},
+		{
+			name:     "Default template test",
+			coverage: 80.0,
+			config: &config{
+				Template: defaultTemplate,
+				Levels:   Levels{70.0: "#44cc11", 40.0: "#dfb317", 0.0: "#ff0001"},
+			},
+			contains: []string{"80.0"},
+		},
+		{
+			name:     "Template with invalid syntax",
 			coverage: 50.0,
 			config: &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        `<svg>{{.InvalidField}}</svg>`,
+				Template: `<svg><text>{{.Coverage}%</text></svg>`, // Missing closing brace
+				Levels:   Levels{70.0: "#44cc11"},
 			},
 			shouldError: true,
-			contains:    []string{},
+		},
+		{
+			name:     "Template with undefined variable",
+			coverage: 60.0,
+			config: &config{
+				Template: `<svg><text>{{.UndefinedVar}}%</text></svg>`,
+				Levels:   Levels{70.0: "#44cc11"},
+			},
+			shouldError: true,
 		},
 	}
 
@@ -205,305 +1108,25 @@ func TestGenerateBadge(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			result, err := generateBadge(tt.coverage, tt.config)
+			a := app{config: *tt.config}
+			a.CoveragePC = &tt.coverage
 
-			if tt.shouldError {
-				if err == nil {
-					t.Errorf("Expected error for %s, but got none", tt.name)
-				}
-
+			result, err := a.generateBadge()
+			if tt.shouldError && err == nil {
+				t.Error("Expected error but got none")
 				return
 			}
 
-			if err != nil {
-				t.Errorf("Unexpected error for %s: %v", tt.name, err)
+			if !tt.shouldError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
 				return
 			}
 
-			for _, expected := range tt.contains {
-				if !strings.Contains(result, expected) {
-					t.Errorf("Expected result to contain %q, but it didn't. Result: %s", expected, result)
-				}
-			}
-		})
-	}
-}
-
-func TestGenerateBadgeWithDefaultTemplate(t *testing.T) {
-	t.Parallel()
-
-	config := &config{
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-		Template:        defaultTemplate,
-	}
-
-	result, err := generateBadge(85.5, config)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Check that the result looks like a valid SVG
-	if !strings.HasPrefix(result, "<svg") {
-		t.Error("Expected result to start with '<svg'")
-	}
-
-	if !strings.HasSuffix(strings.TrimSpace(result), "</svg>") {
-		t.Error("Expected result to end with '</svg>'")
-	}
-
-	if !strings.Contains(result, "85.5") {
-		t.Error("Expected result to contain coverage percentage")
-	}
-}
-
-func TestConfigDefaults(t *testing.T) {
-	t.Parallel()
-
-	config := &config{
-		TestCommand:     "go test ./... -coverprofile=coverage.out",
-		OutputFile:      "coverage-badge.svg",
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-	}
-
-	// Test that default values are sensible
-	if config.TestCommand == "" {
-		t.Error("TestCommand should have a default value")
-	}
-
-	if config.OutputFile == "" {
-		t.Error("OutputFile should have a default value")
-	}
-
-	if config.RedThreshold <= 0 || config.RedThreshold >= 100 {
-		t.Error("RedThreshold should be between 0 and 100")
-	}
-
-	if config.YellowThreshold <= config.RedThreshold || config.YellowThreshold >= 100 {
-		t.Error("YellowThreshold should be between RedThreshold and 100")
-	}
-}
-
-func TestTemplateValidation(t *testing.T) {
-	t.Parallel()
-
-	// Test that the default template is valid
-	tmpl, err := template.New("test").Parse(defaultTemplate)
-	if err != nil {
-		t.Errorf("Default template is invalid: %v", err)
-	}
-
-	// Test that template can be executed with expected data
-	data := struct {
-		Coverage string
-		Color    string
-	}{
-		Coverage: "75.5",
-		Color:    "#44cc11",
-	}
-
-	var buf strings.Builder
-
-	err = tmpl.Execute(&buf, data)
-	if err != nil {
-		t.Errorf("Failed to execute default template: %v", err)
-	}
-
-	result := buf.String()
-	if !strings.Contains(result, "75.5") {
-		t.Error("Template execution should include coverage value")
-	}
-
-	if !strings.Contains(result, "#44cc11") {
-		t.Error("Template execution should include color value")
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestRunApplication(t *testing.T) {
-	tempDir := t.TempDir()
-	coverageFile := filepath.Join(tempDir, "test.out")
-	coverageContent := `mode: set
-github.com/test/example.go:10.5,15.10 5 1
-github.com/test/example.go:20.5,25.10 3 0`
-
-	err := os.WriteFile(coverageFile, []byte(coverageContent), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to create coverage file: %v", err)
-	}
-
-	tests := []struct {
-		name          string
-		config        *config
-		expectError   bool
-		errorContains string
-	}{
-		{
-			name: "Valid configuration - quiet mode",
-			config: &config{
-				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
-				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        "", // Use default template
-				Quiet:           true,
-			},
-			expectError: false,
-		},
-		{
-			name: "Valid configuration - verbose mode",
-			config: &config{
-				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
-				OutputFile:      filepath.Join(tempDir, "test-badge-verbose.svg"),
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        "", // Use default template
-				Quiet:           false,
-			},
-			expectError: false,
-		},
-		{
-			name: "Invalid template file",
-			config: &config{
-				TestCommand:     "echo 'test'",
-				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        "/nonexistent/template.svg",
-				Quiet:           true,
-			},
-			expectError:   true,
-			errorContains: "could not read template file",
-		},
-		{
-			name: "Invalid test command",
-			config: &config{
-				TestCommand:     "",
-				OutputFile:      filepath.Join(tempDir, "test-badge.svg"),
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        "", // Use default template
-				Quiet:           true,
-			},
-			expectError:   true,
-			errorContains: "error getting coverage",
-		},
-		{
-			name: "Invalid output directory",
-			config: &config{
-				TestCommand:     "echo 'test output' && echo 'coverage: statements' -coverprofile=" + coverageFile,
-				OutputFile:      "/invalid/path/badge.svg",
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        "", // Use default template
-				Quiet:           true,
-			},
-			expectError:   true,
-			errorContains: "error writing badge file",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Chdir(tempDir)
-
-			err := runApplication(tt.config)
-
-			if tt.expectError { //nolint:nestif // ok
-				if err == nil {
-					t.Errorf("Expected error but got none")
-					return
-				}
-
-				if tt.errorContains != "" && !strings.Contains(err.Error(), tt.errorContains) {
-					t.Errorf("Expected error to contain %q, got: %v", tt.errorContains, err)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-					return
-				}
-
-				// Verify output file was created
-				if _, err := os.Stat(tt.config.OutputFile); err != nil {
-					t.Errorf("Output file not created: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestLoadTemplate(t *testing.T) {
-	t.Parallel()
-
-	tempDir := t.TempDir()
-	testTemplateFile := filepath.Join(tempDir, "test-template.svg")
-	testTemplateContent := `<svg><text>{{.Coverage}}% test</text></svg>`
-
-	err := os.WriteFile(testTemplateFile, []byte(testTemplateContent), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to create test template: %v", err)
-	}
-
-	tests := []struct {
-		name             string
-		config           *config
-		expectError      bool
-		expectedTemplate string
-	}{
-		{
-			name: "Load from file",
-			config: &config{
-				Template: testTemplateFile,
-			},
-			expectError:      false,
-			expectedTemplate: testTemplateContent,
-		},
-		{
-			name: "Use default template",
-			config: &config{
-				Template: "",
-			},
-			expectError:      false,
-			expectedTemplate: defaultTemplate,
-		},
-		{
-			name: "Nonexistent file",
-			config: &config{
-				Template: "/nonexistent/file.svg",
-			},
-			expectError: true,
-		},
-		{
-			name: "Empty filename",
-			config: &config{
-				Template: "",
-			},
-			expectError:      false,
-			expectedTemplate: defaultTemplate,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			err := loadTemplate(tt.config)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-					return
-				}
-
-				if tt.config.Template != tt.expectedTemplate {
-					t.Errorf("Expected template content to be %q, got %q",
-						tt.expectedTemplate, tt.config.Template)
+			if !tt.shouldError {
+				for _, expected := range tt.contains {
+					if !strings.Contains(result, expected) {
+						t.Errorf("Result should contain %q, got: %s", expected, result)
+					}
 				}
 			}
 		})
@@ -513,68 +1136,37 @@ func TestLoadTemplate(t *testing.T) {
 func TestWriteBadgeFile(t *testing.T) {
 	t.Parallel()
 
-	tempDir := t.TempDir()
 	tests := []struct {
-		name        string
-		filename    string
-		content     string
-		expectError bool
+		name         string
+		setupFunc    func(t *testing.T, tempDir string) (string, string)
+		expectError  bool
+		validateFunc func(t *testing.T, filename, content string)
 	}{
 		{
-			name:        "Valid file write",
-			filename:    filepath.Join(tempDir, "test-badge.svg"),
-			content:     `<svg><text>75.5%</text></svg>`,
-			expectError: false,
-		},
-		{
-			name:        "Write to subdirectory",
-			filename:    filepath.Join(tempDir, "subdir", "badge.svg"),
-			content:     `<svg><text>100.0%</text></svg>`,
-			expectError: true, // subdirectory doesn't exist
-		},
-		{
-			name:        "Empty content",
-			filename:    filepath.Join(tempDir, "empty-badge.svg"),
-			content:     "",
-			expectError: false,
-		},
-		{
-			name:        "Large content",
-			filename:    filepath.Join(tempDir, "large-badge.svg"),
-			content:     strings.Repeat("<svg>test</svg>", 1000),
-			expectError: false,
-		},
-	}
+			name: "Valid file write",
+			setupFunc: func(t *testing.T, tempDir string) (string, string) {
+				t.Helper()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+				filename := filepath.Join(tempDir, "test-badge.svg")
+				content := `<svg><text>75.5%</text></svg>`
 
-			err := writeBadgeFile(tt.filename, tt.content)
-			if tt.expectError { //nolint:nestif // ok
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-					return
-				}
+				return filename, content
+			},
+			validateFunc: func(t *testing.T, filename, content string) {
+				t.Helper()
 
-				// Verify file exists and contains expected content
-				data, err := os.ReadFile(tt.filename)
+				data, err := os.ReadFile(filename)
 				if err != nil {
 					t.Errorf("Failed to read written file: %v", err)
 					return
 				}
 
-				if string(data) != tt.content {
-					t.Errorf("File content doesn't match. Expected %q, got %q",
-						tt.content, string(data))
+				if string(data) != content {
+					t.Errorf("File content = %q, want %q", string(data), content)
 				}
 
 				// Check file permissions
-				info, err := os.Stat(tt.filename)
+				info, err := os.Stat(filename)
 				if err != nil {
 					t.Errorf("Failed to stat file: %v", err)
 					return
@@ -582,131 +1174,101 @@ func TestWriteBadgeFile(t *testing.T) {
 
 				expectedMode := os.FileMode(0o640)
 				if info.Mode().Perm() != expectedMode {
-					t.Errorf("File has wrong permissions. Expected %v, got %v",
-						expectedMode, info.Mode().Perm())
+					t.Errorf("File permissions = %v, want %v", info.Mode().Perm(), expectedMode)
 				}
-			}
-		})
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestMainFunctionIntegration(t *testing.T) {
-	tempDir := t.TempDir()
-	coverageFile := filepath.Join(tempDir, "coverage.out")
-	coverageContent := `mode: set
-github.com/test/main.go:10.5,15.10 8 1
-github.com/test/main.go:20.5,25.10 4 1`
-
-	err := os.WriteFile(coverageFile, []byte(coverageContent), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to create coverage file: %v", err)
-	}
-
-	config := &config{
-		TestCommand:     "echo 'test completed' -coverprofile=" + coverageFile,
-		OutputFile:      filepath.Join(tempDir, "main-test-badge.svg"),
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-		Template:        "", // Should use default
-		DumpTemplate:    false,
-		Quiet:           true,
-	}
-
-	t.Chdir(tempDir)
-
-	err = runApplication(config)
-	if err != nil {
-		t.Errorf("runApplication failed: %v", err)
-		return
-	}
-
-	// Verify badge was created
-	badgeData, err := os.ReadFile(config.OutputFile)
-	if err != nil {
-		t.Errorf("Badge file not created: %v", err)
-		return
-	}
-
-	badgeContent := string(badgeData)
-	if !strings.Contains(badgeContent, "<svg") {
-		t.Error("Badge doesn't contain SVG content")
-	}
-
-	if !strings.Contains(badgeContent, "100.0") {
-		t.Error("Badge doesn't contain expected coverage percentage")
-	}
-}
-
-func BenchmarkGetColor(b *testing.B) {
-	for b.Loop() {
-		getColor(75.5, 40.0, 70.0)
-	}
-}
-
-func BenchmarkRunApplication(b *testing.B) {
-	tempDir := b.TempDir()
-	coverageFile := filepath.Join(tempDir, "coverage.out")
-	coverageContent := `mode: set
-github.com/test/main.go:10.5,15.10 10 1`
-	os.WriteFile(coverageFile, []byte(coverageContent), 0o644)
-
-	config := &config{
-		TestCommand:     "echo 'test' -coverprofile=" + coverageFile,
-		OutputFile:      filepath.Join(tempDir, "bench-badge.svg"),
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-		Template:        defaultTemplate,
-		Quiet:           true,
-	}
-
-	b.Chdir(tempDir)
-	b.ResetTimer()
-
-	for b.Loop() {
-		_ = runApplication(config)
-	}
-}
-
-func TestConfigurationEdgeCases(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		config *config
-		valid  bool
-	}{
-		{
-			name: "Zero thresholds",
-			config: &config{
-				RedThreshold:    0,
-				YellowThreshold: 0,
 			},
-			valid: true, // Should work even with zero thresholds
 		},
 		{
-			name: "Negative thresholds",
-			config: &config{
-				RedThreshold:    -10,
-				YellowThreshold: -5,
+			name: "Empty content",
+			setupFunc: func(t *testing.T, tempDir string) (string, string) {
+				t.Helper()
+
+				filename := filepath.Join(tempDir, "empty-badge.svg")
+				content := ""
+
+				return filename, content
 			},
-			valid: true, // Function should handle negative values
+			validateFunc: func(t *testing.T, filename, content string) {
+				t.Helper()
+
+				data, err := os.ReadFile(filename)
+				if err != nil {
+					t.Errorf("Failed to read written file: %v", err)
+					return
+				}
+
+				if string(data) != content {
+					t.Errorf("File content = %q, want %q", string(data), content)
+				}
+			},
 		},
 		{
-			name: "Very high thresholds",
-			config: &config{
-				RedThreshold:    150,
-				YellowThreshold: 200,
+			name: "Large content",
+			setupFunc: func(t *testing.T, tempDir string) (string, string) {
+				t.Helper()
+
+				filename := filepath.Join(tempDir, "large-badge.svg")
+				content := strings.Repeat("<svg>test</svg>", 1000)
+
+				return filename, content
 			},
-			valid: true,
+			validateFunc: func(t *testing.T, filename, content string) {
+				t.Helper()
+
+				data, err := os.ReadFile(filename)
+				if err != nil {
+					t.Errorf("Failed to read written file: %v", err)
+					return
+				}
+
+				if string(data) != content {
+					t.Error("Large file content doesn't match expected")
+				}
+			},
 		},
 		{
-			name: "Red higher than yellow",
-			config: &config{
-				RedThreshold:    80,
-				YellowThreshold: 50,
+			name: "Write to non-existent directory",
+			setupFunc: func(t *testing.T, tempDir string) (string, string) {
+				t.Helper()
+
+				filename := filepath.Join(tempDir, "nonexistent", "badge.svg")
+				content := `<svg><text>test</text></svg>`
+
+				return filename, content
 			},
-			valid: true, // Function should handle this case
+			expectError: true,
+		},
+		{
+			name: "Write to directory without write permissions",
+			setupFunc: func(t *testing.T, tempDir string) (string, string) {
+				t.Helper()
+
+				if os.Geteuid() == 0 {
+					t.Skip("Skipping permission test when running as root")
+				}
+
+				readOnlyDir := filepath.Join(tempDir, "readonly")
+				err := os.Mkdir(readOnlyDir, 0o755)
+				if err != nil {
+					t.Fatalf("Failed to create directory: %v", err)
+				}
+
+				err = os.Chmod(readOnlyDir, 0o555) // Read and execute only
+				if err != nil {
+					t.Fatalf("Failed to set directory permissions: %v", err)
+				}
+
+				// Restore permissions for cleanup
+				t.Cleanup(func() {
+					os.Chmod(readOnlyDir, 0o755)
+				})
+
+				filename := filepath.Join(readOnlyDir, "badge.svg")
+				content := `<svg><text>test</text></svg>`
+
+				return filename, content
+			},
+			expectError: true,
 		},
 	}
 
@@ -714,581 +1276,187 @@ func TestConfigurationEdgeCases(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Test that getColor doesn't panic with unusual threshold values
-			color := getColor(50.0, tt.config.RedThreshold, tt.config.YellowThreshold)
-			if color == "" {
-				t.Error("getColor returned empty string")
-			}
-		})
-	}
-}
+			tempDir := t.TempDir()
+			filename, content := tt.setupFunc(t, tempDir)
+			a := app{config: config{OutputFile: filename}}
 
-func TestParseCoverageFileEdgeCases(t *testing.T) {
-	t.Parallel()
-
-	tempDir := t.TempDir()
-	tests := []struct {
-		name        string
-		content     string
-		expected    float64
-		shouldError bool
-	}{
-		{
-			name: "File with only mode line and empty lines",
-			content: `mode: set
-
-
-`,
-			expected:    0.0,
-			shouldError: false,
-		},
-		{
-			name: "File with malformed lines (should be skipped)",
-			content: `mode: set
-github.com/test/file.go:10.5,15.10 5 1
-malformed line without proper format
-github.com/test/file.go:20.5,25.10 3 0
-another malformed line
-`,
-			expected:    62.5, // 5/8 * 100
-			shouldError: false,
-		},
-		{
-			name: "File with very large numbers",
-			content: `mode: set
-github.com/test/file.go:10.5,15.10 1000000 1
-github.com/test/file.go:20.5,25.10 500000 0
-`,
-			expected:    66.7, // 1000000/1500000 * 100 ≈ 66.7%
-			shouldError: false,
-		},
-		{
-			name: "File with zero statement counts",
-			content: `mode: set
-github.com/test/file.go:10.5,15.10 0 1
-github.com/test/file.go:20.5,25.10 0 0
-`,
-			expected:    0.0,
-			shouldError: false,
-		},
-		{
-			name: "File with mixed valid and invalid lines",
-			content: `mode: set
-github.com/test/file.go:10.5,15.10 abc 1
-github.com/test/file.go:20.5,25.10 5 def
-github.com/test/file.go:30.5,35.10 10 1
-`,
-			expected:    100.0, // Only the valid line: 10/10 * 100
-			shouldError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			testFile := filepath.Join(tempDir, "coverage-"+strings.ReplaceAll(tt.name, " ", "-")+".out")
-
-			err := os.WriteFile(testFile, []byte(tt.content), 0o644)
-			if err != nil {
-				t.Fatalf("Failed to create test file: %v", err)
-			}
-
-			result, err := parseCoverageFile(testFile)
-
-			if tt.shouldError {
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-
+			err := a.writeBadgeFile(content)
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
 				return
 			}
 
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.validateFunc != nil {
+				tt.validateFunc(t, filename, content)
+			}
+		})
+	}
+}
+
+// Helper function for floating point comparison
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+
+	return x
+}
+
+func (l *Levels) eq(other Levels) bool {
+	if len(*l) != len(other) {
+		return false
+	}
+
+	for level, color := range *l {
+		if other[level] != color {
+			return false
+		}
+	}
+
+	return true
+}
+
+func TestNewApp(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		args        []string
+		expectError bool
+		validate    func(t *testing.T, app app)
+	}{
+		{
+			name: "Valid args with defaults",
+			args: []string{},
+			validate: func(t *testing.T, app app) {
+				t.Helper()
+
+				if app.defaultConfig == "" {
+					t.Error("defaultConfig should not be empty")
+				}
+
+				if app.defaultConfigFile != defaultConfigFile {
+					t.Errorf("defaultConfigFile = %q, want %q", app.defaultConfigFile, defaultConfigFile)
+				}
+
+				if app.dumpSink == nil {
+					t.Error("dumpSink should not be nil")
+				}
+			},
+		},
+		{
+			name: "Valid args with flags",
+			args: []string{"-quiet", "-output", "test.svg"},
+			validate: func(t *testing.T, app app) {
+				t.Helper()
+
+				if !app.Quiet {
+					t.Error("Quiet should be true")
+				}
+
+				if app.OutputFile != "test.svg" {
+					t.Errorf("OutputFile = %q, want %q", app.OutputFile, "test.svg")
+				}
+			},
+		},
+		{
+			name: "Valid coverage flag",
+			args: []string{"-coverage", "85.5"},
+			validate: func(t *testing.T, app app) {
+				t.Helper()
+
+				if app.CoveragePC == nil {
+					t.Error("CoveragePC should not be nil")
+				} else if *app.CoveragePC != 85.5 {
+					t.Errorf("CoveragePC = %f, want %f", *app.CoveragePC, 85.5)
+				}
+			},
+		},
+		{
+			name:        "Invalid flag",
+			args:        []string{"-invalid-flag"},
+			expectError: true,
+		},
+		{
+			name:        "Help flag",
+			args:        []string{"-help"},
+			expectError: true, // flag.Parse will return an error for -help
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fs := flag.NewFlagSet("test", flag.ContinueOnError)
+			app, err := newApp(fs, tt.args)
+
+			if tt.expectError && err == nil {
+				t.Error("Expected error but got none")
+				return
+			}
+
+			if !tt.expectError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.validate != nil && !tt.expectError {
+				tt.validate(t, app)
+			}
+		})
+	}
+}
+
+func TestAppDumpOperations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		config   config
+		contains string
+	}{
+		{
+			name: "Dump template",
+			config: config{
+				DumpTemplate: true,
+			},
+			contains: "<svg",
+		},
+		{
+			name: "Dump config",
+			config: config{
+				DumpConfig: true,
+			},
+			contains: "testCommand",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var output strings.Builder
+
+			a := app{
+				config:   tt.config,
+				dumpSink: &output,
+			}
+
+			err := a.run()
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 				return
 			}
 
-			tolerance := 0.1
-			if result < tt.expected-tolerance || result > tt.expected+tolerance {
-				t.Errorf("Expected coverage %.1f%%, got %.1f%%", tt.expected, result)
-			}
-		})
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestRunTestsAndGetCoverageEdgeCases(t *testing.T) {
-	tempDir := t.TempDir()
-	tests := []struct {
-		name        string
-		command     string
-		setupFunc   func() error
-		expectError bool
-	}{
-		{
-			name:    "Command with single word",
-			command: "echo",
-			setupFunc: func() error {
-				return os.WriteFile("coverage.out", []byte("mode: set\n"), 0o644)
-			},
-			expectError: false,
-		},
-		{
-			name:    "Command that creates coverage in current directory",
-			command: "echo 'test'",
-			setupFunc: func() error {
-				return os.WriteFile("coverage.out", []byte(`mode: set
-test.go:1.1,2.2 1 1
-`), 0o644)
-			},
-			expectError: false,
-		},
-		{
-			name:    "Command with custom coverage profile name",
-			command: "echo 'test' -coverprofile=custom.out",
-			setupFunc: func() error {
-				return os.WriteFile("custom.out", []byte(`mode: set
-test.go:1.1,2.2 5 1
-`), 0o644)
-			},
-			expectError: false,
-		},
-		{
-			name:        "Command with spaces in arguments",
-			command:     `echo "hello world" test arguments`,
-			setupFunc:   func() error { return os.WriteFile("coverage.out", []byte("mode: set\n"), 0o644) },
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Chdir(tempDir)
-
-			if tt.setupFunc != nil {
-				if err := tt.setupFunc(); err != nil {
-					t.Fatalf("Setup failed: %v", err)
-				}
-			}
-
-			_, err := runTestsAndGetCoverage(tt.command, false)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-			} else if err != nil {
-				t.Logf("Command failed (may be expected in test environment): %v", err)
-			}
-
-			// Clean up for next test
-			os.RemoveAll(tempDir)
-			os.MkdirAll(tempDir, 0o755)
-		})
-	}
-}
-
-func TestGenerateBadgeTemplateErrors(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		coverage    float64
-		template    string
-		expectError bool
-	}{
-		{
-			name:        "Template with invalid syntax",
-			coverage:    75.0,
-			template:    `<svg>{{.Coverage</svg>`, // Missing closing }}
-			expectError: true,
-		},
-		{
-			name:        "Template with undefined function",
-			coverage:    75.0,
-			template:    `<svg>{{unknownFunc .Coverage}}</svg>`,
-			expectError: true,
-		},
-		{
-			name:        "Template with nil data access",
-			coverage:    75.0,
-			template:    `<svg>{{.Coverage.NonExistent}}</svg>`,
-			expectError: true,
-		},
-		{
-			name:        "Empty template",
-			coverage:    75.0,
-			template:    ``,
-			expectError: false, // Empty template should work
-		},
-		{
-			name:        "Template with complex expressions",
-			coverage:    75.0,
-			template:    `<svg>{{.Coverage | invalidFunc}}</svg>`,
-			expectError: true, // Should fail because invalidFunc doesn't exist
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			config := &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        tt.template,
-			}
-
-			_, err := generateBadge(tt.coverage, config)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("Expected error but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestWriteBadgeFilePermissions(t *testing.T) {
-	t.Parallel()
-
-	if os.Geteuid() == 0 {
-		t.Skip("Skipping permission test when running as root")
-	}
-
-	tempDir := t.TempDir()
-	readOnlyDir := filepath.Join(tempDir, "readonly")
-
-	err := os.Mkdir(readOnlyDir, 0o755)
-	if err != nil {
-		t.Fatalf("Failed to create read-only directory: %v", err)
-	}
-
-	err = os.Chmod(readOnlyDir, 0o555) // Read and execute only
-	if err != nil {
-		t.Fatalf("Failed to set directory permissions: %v", err)
-	}
-
-	// Try to write to read-only directory
-	readOnlyFile := filepath.Join(readOnlyDir, "badge.svg")
-
-	err = writeBadgeFile(readOnlyFile, "<svg>test</svg>")
-	if err == nil {
-		t.Error("Expected error when writing to read-only directory, but got none")
-	}
-
-	// Restore permissions for cleanup
-	os.Chmod(readOnlyDir, 0o755)
-}
-
-func BenchmarkLoadTemplate(b *testing.B) {
-	config := &config{
-		Template: "", // Use default template
-	}
-
-	b.ResetTimer()
-
-	for b.Loop() {
-		_ = loadTemplate(config)
-	}
-}
-
-func BenchmarkWriteBadgeFile(b *testing.B) {
-	tempDir := b.TempDir()
-	content := `<svg xmlns="http://www.w3.org/2000/svg" width="104" height="20">
-		<text x="10" y="15">75.5%</text>
-	</svg>`
-
-	b.ResetTimer()
-
-	for i := range b.N {
-		filename := filepath.Join(tempDir, fmt.Sprintf("badge-%d.svg", i))
-		_ = writeBadgeFile(filename, content)
-	}
-}
-
-func BenchmarkGenerateBadge(b *testing.B) {
-	config := &config{
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-		Template:        defaultTemplate,
-	}
-
-	b.ResetTimer()
-
-	for b.Loop() {
-		_, _ = generateBadge(75.5, config)
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestRunTestsAndGetCoverageIntegration(t *testing.T) {
-	tempDir := t.TempDir()
-	coverageFile := filepath.Join(tempDir, "test-coverage.out")
-	coverageContent := `mode: set
-github.com/test/repo/file1.go:10.5,15.10 5 1
-github.com/test/repo/file2.go:20.5,25.10 3 0
-github.com/test/repo/file3.go:30.5,35.10 2 1`
-
-	err := os.WriteFile(coverageFile, []byte(coverageContent), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to create test coverage file: %v", err)
-	}
-
-	tests := []struct {
-		name          string
-		command       string
-		expectedError bool
-		expectedRange []float64 // [min, max] for coverage percentage
-	}{
-		{
-			name:          "Invalid command - empty",
-			command:       "",
-			expectedError: true,
-			expectedRange: []float64{0, 0},
-		},
-		{
-			name:          "Invalid command - nonexistent binary",
-			command:       "nonexistent-command test",
-			expectedError: true,
-			expectedRange: []float64{0, 0},
-		},
-		{
-			name:          "Valid command with custom coverage file",
-			command:       "echo 'test output' && echo 'coverage: 70.0% of statements' -coverprofile=" + coverageFile,
-			expectedError: false,
-			expectedRange: []float64{60, 80}, // Expected around 70%
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Chdir(tempDir)
-
-			coverage, err := runTestsAndGetCoverage(tt.command, false)
-			if tt.expectedError {
-				if err == nil {
-					t.Errorf("Expected error for command %q, but got none", tt.command)
-				}
-
-				return
-			}
-
-			if err != nil && !tt.expectedError {
-				// For valid commands that might still fail due to environment,
-				// we'll be more lenient and just check the parsing logic
-				t.Logf("Command failed (expected in test environment): %v", err)
-				return
-			}
-
-			if len(tt.expectedRange) == 2 && (coverage < tt.expectedRange[0] || coverage > tt.expectedRange[1]) {
-				t.Errorf("Coverage %f not in expected range [%f, %f]",
-					coverage, tt.expectedRange[0], tt.expectedRange[1])
-			}
-		})
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestRunTestsAndGetCoverageWithActualFile(t *testing.T) {
-	// Test with the sample coverage file we created
-	tempDir := t.TempDir()
-	originalDir, _ := os.Getwd()
-
-	t.Chdir(tempDir)
-
-	// Copy our test coverage file
-	sourceFile := filepath.Join(originalDir, "testdata", "coverage-sample.out")
-	destFile := filepath.Join(tempDir, "coverage.out")
-
-	// Read source file
-	data, err := os.ReadFile(sourceFile)
-	if err != nil {
-		t.Skipf("Skipping test - cannot read sample coverage file: %v", err)
-	}
-
-	// Write to destination
-	err = os.WriteFile(destFile, data, 0o644)
-	if err != nil {
-		t.Fatalf("Failed to write test coverage file: %v", err)
-	}
-
-	// Test with a simple command that should succeed
-	command := "echo 'Running tests...' -coverprofile=coverage.out"
-
-	coverage, err := runTestsAndGetCoverage(command, false)
-	if err != nil {
-		// The command might fail, but if it does, test the parsing directly
-		t.Logf("Command failed (testing parsing directly): %v", err)
-
-		coverage, err = parseCoverageFile(destFile)
-		if err != nil {
-			t.Fatalf("Failed to parse coverage file: %v", err)
-		}
-	}
-
-	// Coverage should be reasonable (between 0 and 100)
-	if coverage < 0 || coverage > 100 {
-		t.Errorf("Coverage %f is not in valid range [0, 100]", coverage)
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestEndToEndWorkflow(t *testing.T) {
-	tempDir := t.TempDir()
-
-	t.Chdir(tempDir)
-
-	coverageContent := `mode: set
-example.go:10.5,15.10 10 1
-example.go:20.5,25.10 5 0
-example.go:30.5,35.10 3 1`
-
-	err := os.WriteFile("coverage.out", []byte(coverageContent), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to create coverage file: %v", err)
-	}
-
-	// Test the complete workflow: parse -> generate badge
-	coverage, err := parseCoverageFile("coverage.out")
-	if err != nil {
-		t.Fatalf("Failed to parse coverage: %v", err)
-	}
-
-	config := &config{
-		RedThreshold:    40.0,
-		YellowThreshold: 70.0,
-		Template:        defaultTemplate,
-	}
-
-	badge, err := generateBadge(coverage, config)
-	if err != nil {
-		t.Fatalf("Failed to generate badge: %v", err)
-	}
-
-	// Write the badge to a file
-	badgeFile := "test-badge.svg"
-
-	err = os.WriteFile(badgeFile, []byte(badge), 0o644)
-	if err != nil {
-		t.Fatalf("Failed to write badge file: %v", err)
-	}
-
-	// Verify the badge file exists and contains expected content
-	badgeData, err := os.ReadFile(badgeFile)
-	if err != nil {
-		t.Fatalf("Failed to read badge file: %v", err)
-	}
-
-	badgeStr := string(badgeData)
-	if !strings.Contains(badgeStr, "<svg") {
-		t.Error("Badge should contain SVG content")
-	}
-
-	// Check that the coverage percentage is in the badge
-	// 10 statements covered (first block) + 3 statements covered (third block) = 13 covered
-	// Total statements: 10 + 5 + 3 = 18
-	// Coverage: 13/18 * 100 = 72.2%
-	expectedCoverage := 72.2
-
-	coverageStr := strings.Contains(badgeStr, "72.2")
-	if !coverageStr {
-		t.Errorf("Badge should contain coverage percentage (expected ~%.1f%%), got: %s", expectedCoverage, badgeStr)
-	}
-}
-
-//nolint:paralleltest // t.Chdir
-func TestEndToEndWorkflowWithVariousCoverageScenarios(t *testing.T) {
-	scenarios := []struct {
-		name     string
-		content  string
-		expected float64
-	}{
-		{
-			name: "Zero coverage",
-			content: `mode: set
-test.go:10.5,15.10 5 0
-test.go:20.5,25.10 3 0`,
-			expected: 0.0,
-		},
-		{
-			name: "Partial coverage",
-			content: `mode: set
-test.go:10.5,15.10 6 1
-test.go:20.5,25.10 4 0`,
-			expected: 60.0, // 6/10 * 100
-		},
-		{
-			name: "Full coverage",
-			content: `mode: set
-test.go:10.5,15.10 4 1
-test.go:20.5,25.10 2 1`,
-			expected: 100.0,
-		},
-	}
-
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			tempDir := t.TempDir()
-
-			t.Chdir(tempDir)
-
-			// Create coverage file
-			err := os.WriteFile("coverage.out", []byte(scenario.content), 0o644)
-			if err != nil {
-				t.Fatalf("Failed to create coverage file: %v", err)
-			}
-
-			// Parse coverage
-			coverage, err := parseCoverageFile("coverage.out")
-			if err != nil {
-				t.Fatalf("Failed to parse coverage: %v", err)
-			}
-
-			// Check coverage matches expected
-			tolerance := 0.1
-			if coverage < scenario.expected-tolerance || coverage > scenario.expected+tolerance {
-				t.Errorf("Expected coverage %.1f%%, got %.1f%%", scenario.expected, coverage)
-			}
-
-			// Generate badge
-			config := &config{
-				RedThreshold:    40.0,
-				YellowThreshold: 70.0,
-				Template:        defaultTemplate,
-			}
-
-			badge, err := generateBadge(coverage, config)
-			if err != nil {
-				t.Fatalf("Failed to generate badge: %v", err)
-			}
-
-			// Verify badge contains expected coverage
-			expectedStr := fmt.Sprintf("%.1f", scenario.expected)
-			if !strings.Contains(badge, expectedStr) {
-				t.Errorf("Badge should contain coverage %s%%, got: %s", expectedStr, badge)
-			}
-
-			// Verify badge color based on coverage
-			var expectedColor string
-
-			switch {
-			case scenario.expected < 40.0:
-				expectedColor = "#e05d44" // red
-			case scenario.expected < 70.0:
-				expectedColor = "#dfb317" // yellow
-			default:
-				expectedColor = "#44cc11" // green
-			}
-
-			if !strings.Contains(badge, expectedColor) {
-				t.Errorf("Badge should contain color %s for %.1f%% coverage", expectedColor, scenario.expected)
+			result := output.String()
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("Output should contain %q, got: %q", tt.contains, result)
 			}
 		})
 	}

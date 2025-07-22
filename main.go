@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -15,92 +17,202 @@ import (
 	"text/template"
 )
 
-type config struct {
-	TestCommand     string
-	OutputFile      string
-	Template        string
-	RedThreshold    float64
-	YellowThreshold float64
-	DumpTemplate    bool
-	Quiet           bool
-	AutoClean       bool
+//nolint:govet,recvcheck // ok
+type app struct {
+	config
+
+	defaultConfig     string
+	defaultConfigFile string
+	dumpSink          io.Writer
 }
 
-//go:embed coverage-template.svg
+type config struct {
+	Levels       Levels   `json:"levels,omitzero"`
+	CoveragePC   *float64 `json:"-"`
+	TestCommand  string   `json:"testCommand"`
+	OutputFile   string   `json:"outputFile"`
+	ConfigFile   string   `json:"-"`
+	Template     string   `json:"template"`
+	DumpTemplate bool     `json:"dumpTemplate"`
+	DumpConfig   bool     `json:"dumpConfig"`
+	Quiet        bool     `json:"quiet"`
+	AutoClean    bool     `json:"autoClean"`
+}
+
+const defaultConfigFile = "stampli.json"
+
+//go:embed coverage-badge.tmpl
 var defaultTemplate string
 
-//nolint:gochecknoglobals,mnd // ok
-var cfg = &config{
-	TestCommand:     "go test ./... -coverprofile=coverage.out",
-	OutputFile:      "coverage-badge.svg",
-	RedThreshold:    50.0,
-	YellowThreshold: 80.0,
-	AutoClean:       true,
-}
+//go:embed stampli.json
+var defaultConfig string
+
+var (
+	errEmptyCommand      = errors.New("empty command")
+	errInvalidFileFormat = errors.New("invalid coverage file format")
+)
 
 func main() {
-	flag.Parse()
-
-	if cfg.DumpTemplate {
-		fmt.Print(defaultTemplate) //nolint:forbidigo // ok
-		return
+	a, err := newApp(flag.CommandLine, os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 
-	if err := runApplication(cfg); err != nil {
+	if err = a.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runApplication(config *config) error {
-	if err := loadTemplate(config); err != nil {
-		return err
-	}
+func newApp(fs *flag.FlagSet, args []string) (a app, err error) {
+	a.defaultConfig = defaultConfig
+	a.defaultConfigFile = defaultConfigFile
+	a.dumpSink = os.Stdout
+	err = a.loadConfig(fs, args)
 
-	coverage, err := runTestsAndGetCoverage(config.TestCommand, config.AutoClean)
+	return
+}
+
+func (c *config) merge(other *config) (err error) {
+	js, err := json.Marshal(other)
 	if err != nil {
-		return fmt.Errorf("error getting coverage: %w", err)
+		return fmt.Errorf("failed to marshal other config: %w", err)
 	}
 
-	badge, err := generateBadge(coverage, config)
+	if err = json.Unmarshal(js, c); err != nil {
+		return fmt.Errorf("failed to unmarshal into current config: %w", err)
+	}
+
+	if other.CoveragePC != nil {
+		c.CoveragePC = other.CoveragePC
+	}
+
+	return
+}
+
+func (c *config) loadTemplate() error {
+	if c.Template != "" {
+		data, err := os.ReadFile(c.Template)
+		if err != nil {
+			return fmt.Errorf("could not read template file %s: %w", c.Template, err)
+		}
+
+		c.Template = string(data)
+	} else {
+		c.Template = defaultTemplate
+	}
+
+	return nil
+}
+
+func (a *app) loadConfig(fs *flag.FlagSet, args []string) error {
+	cfg := &a.config
+
+	// Start with embedded defaults.
+	if err := json.Unmarshal([]byte(a.defaultConfig), cfg); err != nil {
+		return fmt.Errorf("failed to load embedded defaults: %w", err)
+	}
+
+	cfg2 := &config{}
+
+	fs.StringVar(&cfg2.TestCommand, "command", cfg.TestCommand, "Command to run tests and generate coverage")
+	fs.StringVar(&cfg2.OutputFile, "output", cfg.OutputFile, "Output SVG file path")
+	fs.StringVar(&cfg.ConfigFile, "config", a.defaultConfigFile, "Path to JSON configuration file")
+	fs.StringVar(&cfg2.Template, "template", cfg.Template, "Path to custom SVG template file (optional)")
+	fs.Var(&cfg2.Levels, "levels", fmt.Sprintf("Coverage levels and colors (default %q)", cfg.Levels.String()))
+	fs.BoolVar(&cfg2.DumpTemplate, "dump-template", cfg.DumpTemplate, "Dump the default SVG template to stdout and exit")
+	fs.BoolVar(&cfg2.DumpConfig, "dump-config", cfg.DumpConfig, "Dump the default configuration to stdout and exit")
+	fs.BoolVar(&cfg2.Quiet, "quiet", cfg.Quiet, "Suppress output messages (only errors will be printed)")
+	fs.BoolVar(&cfg2.AutoClean, "auto-clean", cfg.AutoClean, "Automatically clean up coverage files after generating the badge")
+
+	var (
+		coverageFlag float64
+		coverageSet  bool
+	)
+
+	fs.Func("coverage", "Coverage percentage to use directly (skips running tests)", func(s string) error {
+		val, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err //nolint:wrapcheck // ok
+		}
+
+		coverageFlag = val
+		coverageSet = true
+
+		return nil
+	})
+
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	if coverageSet {
+		cfg2.CoveragePC = &coverageFlag
+	}
+
+	if cfg.ConfigFile != "" {
+		if data, err := os.ReadFile(cfg.ConfigFile); err == nil {
+			if err = json.Unmarshal(data, cfg); err != nil {
+				return fmt.Errorf("failed to parse config file %s: %w", cfg.ConfigFile, err)
+			}
+		} else if cfg.ConfigFile != a.defaultConfigFile {
+			// Otherwise, if a non-default config file was requested, it must exist.
+			return fmt.Errorf("failed to load config file %s: %w", cfg.ConfigFile, err)
+		}
+	}
+
+	return cfg.merge(cfg2)
+}
+
+func (a app) run() (err error) {
+	if a.DumpTemplate {
+		fmt.Fprint(a.dumpSink, defaultTemplate) //nolint:errcheck // ok
+		return
+	}
+
+	if a.DumpConfig {
+		fmt.Fprint(a.dumpSink, defaultConfig) //nolint:errcheck // ok
+		return
+	}
+
+	if err = a.loadTemplate(); err != nil {
+		return
+	}
+
+	if a.CoveragePC == nil {
+		var coverage float64
+
+		coverage, err = a.runTestsAndGetCoverage()
+		if err != nil {
+			return fmt.Errorf("error getting coverage: %w", err)
+		}
+
+		a.CoveragePC = &coverage
+	}
+
+	badge, err := a.generateBadge()
 	if err != nil {
 		return fmt.Errorf("error generating badge: %w", err)
 	}
 
-	if err = writeBadgeFile(config.OutputFile, badge); err != nil {
+	if err = a.writeBadgeFile(badge); err != nil {
 		return fmt.Errorf("error writing badge file: %w", err)
 	}
 
-	if !config.Quiet {
-		fmt.Printf("Coverage badge generated: %s (%.1f%% coverage)\n", config.OutputFile, coverage) //nolint:forbidigo // ok
+	if !a.Quiet {
+		fmt.Printf("Coverage badge generated: %s (%.1f%% coverage)\n", a.OutputFile, *a.CoveragePC) //nolint:forbidigo // ok
 	}
 
-	return nil
+	return
 }
 
-func loadTemplate(config *config) error {
-	if config.Template != "" {
-		data, err := os.ReadFile(config.Template)
-		if err != nil {
-			return fmt.Errorf("could not read template file %s: %w", config.Template, err)
-		}
+func (a app) runTestsAndGetCoverage() (_ float64, err error) {
+	command := a.TestCommand
 
-		config.Template = string(data)
-	} else {
-		config.Template = defaultTemplate
-	}
-
-	return nil
-}
-
-func writeBadgeFile(filename, content string) error {
-	return os.WriteFile(filename, []byte(content), 0o640) //nolint:mnd // ok
-}
-
-func runTestsAndGetCoverage(command string, autoClean bool) (_ float64, err error) {
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
-		return 0, errors.New("empty command")
+		return 0, errEmptyCommand
 	}
 
 	cmd := exec.Command(parts[0], parts[1:]...) //nolint:noctx,gosec // yes, we actually do want end users to be able to drive this
@@ -119,7 +231,7 @@ func runTestsAndGetCoverage(command string, autoClean bool) (_ float64, err erro
 		}
 	}
 
-	if autoClean {
+	if a.AutoClean {
 		defer func() {
 			err = errors.Join(err, os.Remove(coverageFile))
 		}()
@@ -128,70 +240,61 @@ func runTestsAndGetCoverage(command string, autoClean bool) (_ float64, err erro
 	return parseCoverageFile(coverageFile)
 }
 
-func parseCoverageFile(filename string) (float64, error) {
-	file, err := os.Open(filename) //nolint:gosec // it's safe, file is not eval'ed or anything
+func parseCoverageFile(filename string) (cov float64, err error) {
+	cmd := exec.Command("go", "tool", "cover", "-func="+filename) //nolint:gosec,noctx // safe
+
+	output, err := cmd.Output()
 	if err != nil {
-		return 0, fmt.Errorf("could not open coverage file %s: %w", filename, err)
+		return 0, fmt.Errorf("%w: %w", errInvalidFileFormat, err)
 	}
-	defer file.Close() //nolint:errcheck // ok
 
-	var totalStatements, coveredStatements int
+	var lastLine string
 
-	scanner := bufio.NewScanner(file)
-
-	// Skip the first line (mode line).
-	if scanner.Scan() && !strings.HasPrefix(scanner.Text(), "mode:") {
-		return 0, errors.New("invalid coverage file format")
-	}
+	scanner := bufio.NewScanner(bytes.NewReader(output))
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 3 { //nolint:mnd // ok
-			continue
-		}
-
-		// Last two parts are statement count and covered count.
-		stmtCount, err1 := strconv.Atoi(parts[len(parts)-2])
-		coveredCount, err2 := strconv.Atoi(parts[len(parts)-1])
-
-		if err1 != nil || err2 != nil {
-			continue
-		}
-
-		totalStatements += stmtCount
-		if coveredCount > 0 {
-			coveredStatements += stmtCount
-		}
+		lastLine = scanner.Text()
 	}
 
 	if err = scanner.Err(); err != nil {
-		return 0, fmt.Errorf("error reading coverage file: %w", err)
+		return 0, fmt.Errorf("error reading coverage output: %w", err)
 	}
 
-	if totalStatements == 0 {
-		return 0, nil
+	if !strings.HasPrefix(lastLine, "total:") {
+		return 0, fmt.Errorf("%w: total line missing", errInvalidFileFormat)
 	}
 
-	return (float64(coveredStatements) / float64(totalStatements)) * 100, nil //nolint:mnd // ok
+	// Extract percentage from line like "total:						(statements)		87.4%".
+	parts := strings.Fields(lastLine)
+	if x := len(parts); x != 3 { //nolint:mnd // ok
+		return 0, fmt.Errorf("%w: last line parts count != %d", errInvalidFileFormat, x)
+	}
+
+	covStr := strings.TrimSuffix(parts[2], "%")
+
+	cov, err = strconv.ParseFloat(covStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse coverage percentage: %w", err)
+	}
+
+	return
 }
 
-func generateBadge(coverage float64, config *config) (string, error) {
-	color := getColor(coverage, config.RedThreshold, config.YellowThreshold)
+func (a app) generateBadge() (string, error) {
+	color := a.Levels.GetColorForCoverage(*a.CoveragePC)
+	textColor := getOptimalTextColor(color)
 
 	data := struct {
-		Coverage string
-		Color    string
+		Coverage  string
+		Color     string
+		TextColor string
 	}{
-		Coverage: fmt.Sprintf("%.1f", coverage),
-		Color:    color,
+		Coverage:  fmt.Sprintf("%.1f", *a.CoveragePC),
+		Color:     color,
+		TextColor: textColor,
 	}
 
-	tmpl, err := template.New("badge").Parse(config.Template)
+	tmpl, err := template.New("badge").Parse(a.Template)
 	if err != nil {
 		return "", fmt.Errorf("error parsing template: %w", err)
 	}
@@ -204,24 +307,6 @@ func generateBadge(coverage float64, config *config) (string, error) {
 	return buf.String(), nil
 }
 
-func getColor(coverage, redThreshold, yellowThreshold float64) string {
-	switch {
-	case coverage < redThreshold:
-		return "#e05d44"
-	case coverage < yellowThreshold:
-		return "#dfb317"
-	default:
-		return "#44cc11"
-	}
-}
-
-func init() {
-	flag.StringVar(&cfg.TestCommand, "command", cfg.TestCommand, "Command to run tests and generate coverage")
-	flag.StringVar(&cfg.OutputFile, "output", cfg.OutputFile, "Output SVG file path")
-	flag.Float64Var(&cfg.RedThreshold, "red", cfg.RedThreshold, "Red threshold (coverage below this is red)")
-	flag.Float64Var(&cfg.YellowThreshold, "yellow", cfg.YellowThreshold, "Yellow threshold (coverage below this is yellow)")
-	flag.StringVar(&cfg.Template, "template", cfg.Template, "Path to custom SVG template file (optional)")
-	flag.BoolVar(&cfg.DumpTemplate, "dump-template", cfg.DumpTemplate, "Dump the default SVG template to stdout and exit")
-	flag.BoolVar(&cfg.Quiet, "quiet", false, "Suppress output messages (only errors will be printed)")
-	flag.BoolVar(&cfg.AutoClean, "auto-clean", cfg.AutoClean, "Automatically clean up coverage files after generating the badge")
+func (a app) writeBadgeFile(content string) error {
+	return os.WriteFile(a.OutputFile, []byte(content), 0o640) //nolint:wrapcheck,mnd // ok
 }

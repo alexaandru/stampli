@@ -6,13 +6,9 @@ run:
 linters:
   default: all
   disable:
-    - depguard
-    - err113 # TODO
     - exhaustruct
-    - gochecknoinits
     - noinlineerr
     - nonamedreturns
-    - wrapcheck # TODO
     - wsl # obsoleted by wsl_v5
   settings:
     cyclop:
@@ -169,6 +165,7 @@ linters:
         - i int
         - j int
         - T any
+        - a app
     wsl:
       strict-append: true
       allow-assign-and-call: true
@@ -194,7 +191,7 @@ issues:
   max-issues-per-linter: 0
   max-same-issues: 0
   new: false
-  fix: false
+  fix: true
 formatters:
   enable:
     - gofmt

@@ -11,12 +11,20 @@ A lightweight, local Go test coverage badge generator that creates SVG badges si
 
 ## Features
 
-- 🚀 **Runs entirely locally** - no external API calls or internet required
-- 🧪 **Automatically runs Go tests** and extracts coverage data
+- 🚀 **Runs entirely locally** - no external API calls or Internet required
+- 🧪 **Automatically runs Go tests** and extracts coverage data, if needed
+- 📊 **Generates coverage badges** based on test provided coverage % if you already have it
 - 🎨 **Generates shields.io-style SVG badges** with embedded template
 - 🔧 **Fully configurable** test commands, thresholds, and templates
 - 📦 **Single binary** with no dependencies - template is embedded
-- 🛠️ **Template dumping** - export the default template for customization
+- 🛠️ **Template/Config dumping** - export the default template and config for customization
+
+Default Color Scheme & Levels:
+
+![Excellent](testdata/badge-excellent.svg)
+![Fair](testdata/badge-fair.svg)
+![Good](testdata/badge-good.svg)
+![Poor](testdata/badge-poor.svg)
 
 ## Installation
 
@@ -30,120 +38,42 @@ go get tool github.com/alexaandru/stampli@latest
 Run with defaults (uses `go test ./... -coverprofile=coverage.out`):
 
 ```bash
-./stampli
+./stampli # -h for help
 ```
 
-This generates `coverage-badge.svg` in the current directory.
+This generates `coverage-badge.svg` in the current directory by running
+the tests and extracting coverage data.
 
-### Options
-
-- `-command string` - Test command to run (default: `"go test ./... -coverprofile=coverage.out"`)
-- `-output string` - Output SVG file path (default: `"coverage-badge.svg"`)
-- `-red float` - Red threshold - coverage below this is red (default: `50.0`)
-- `-yellow float` - Yellow threshold - coverage below this is yellow (default: `80.0`)
-- `-template string` - Path to custom SVG template file (optional)
-- `-dump-template` - Dump the default SVG template to stdout and exit
-
-## Examples
-
-### Basic Usage
+Alternatively, you can provide the coverage percentage directly:
 
 ```bash
-./stampli
-# Generates coverage-badge.svg with default settings
+./stampli -coverage 85.4
 ```
 
-### Custom Test Command
+See help for more options, including customizing the badge SVG template,
+the command used for running tests (i.e. replace it with `make test`, etc.)
+the levels or the default config, etc.
 
-Use `make test` instead of the default Go command:
+### Coverage Levels System
+
+The `Levels` system allows fine-grained control over thresholds and colors,
+either via cli flag or via JSON config file:
 
 ```bash
-./stampli -command "make test"
+# Format: level=color,level=color,...
+./stampli -levels "95=#00cc00,85=#44cc11,70=#dfb317,50=#ff8c00,=#e05d44"
 ```
 
-### Custom Output Location
+The levels **MUST** include a default level (i.e. `0=#...` or `=#...`).
 
-Save badge to a specific directory:
-
-```bash
-./stampli -output "docs/coverage-badge.svg"
-```
-
-### Strict Coverage Thresholds
-
-Set higher standards (red < 70%, yellow < 90%):
-
-```bash
-./stampli -red 70 -yellow 90
-```
-
-### Working with Templates
-
-**Export the default template for customization:**
-
-```bash
-./stampli -dump-template > my-template.svg
-```
-
-**Edit the template and use it:**
-
-```bash
-# Edit my-template.svg with your favorite editor
-./stampli -template my-template.svg
-```
-
-**Save template to a specific location:**
-
-```bash
-./stampli -dump-template > templates/coverage-badge.svg
-./stampli -template templates/coverage-badge.svg
-```
-
-## Template Customization
+### SVG Template Customization
 
 Stampli uses Go's `text/template` package. Your template receives:
 
-- `{{.Coverage}}` - Coverage percentage as string (e.g., "85.4")
-- `{{.Color}}` - Color hex code based on thresholds (#e05d44, #dfb317, or #4c1)
-
-### Customization Workflow
-
-1. **Export the default template:**
-
-   ```bash
-   ./stampli -dump-template > custom-badge.svg
-   ```
-
-2. **Edit the template:**
-
-   ```bash
-   # Modify custom-badge.svg with your preferred editor
-   # Change colors, fonts, dimensions, layout, etc.
-   ```
-
-3. **Use your custom template:**
-   ```bash
-   ./stampli -template custom-badge.svg
-   ```
-
-### Example Custom Template
-
-Here's a minimal custom template:
-
-```svg
-<svg xmlns="http://www.w3.org/2000/svg" width="120" height="24">
-  <rect width="70" height="24" fill="#555"/>
-  <rect x="70" width="50" height="24" fill="{{.Color}}"/>
-  <text x="35" y="17" fill="white" text-anchor="middle" font-family="Arial" font-size="12">tests</text>
-  <text x="95" y="17" fill="white" text-anchor="middle" font-family="Arial" font-size="12">{{.Coverage}}%</text>
-</svg>
-```
-
-## Color Scheme
-
-- 🔴 **Red** (#e05d44): Coverage below red threshold
-- 🟡 **Yellow** (#dfb317): Coverage between red and yellow thresholds
-- 🟢 **Green** (#4c1): Coverage above yellow threshold
+- `{{ .Coverage }}` - Coverage percentage as string (e.g., "85.4")
+- `{{ .Color }}` - Color hex code based on coverage levels
+- `{{ .TextColor }}` - Optimal text color, #ffffff or #000000 depending
+  on the background.
 
 ## Integration Examples
 
@@ -160,15 +90,15 @@ Here's a minimal custom template:
 ### Make Integration
 
 ```makefile
-coverage-badge:
-	./stampli -command "make test-coverage"
-
-test-coverage:
+test:
 	go test ./... -coverprofile=coverage.out
 
-# Export template for customization
-template:
-	./stampli -dump-template > badge-template.svg
+badge:
+	./stampli -command "make test" -quiet
+
+# Generate badge with custom levels
+badge-strict:
+	./stampli -levels "95=#00ff00,80=#ffff00,60=#ff8000,0=#ff0000"
 ```
 
 ### Pre-commit Hook
@@ -181,4 +111,4 @@ git add coverage-badge.svg
 
 ## License
 
-MIT License - see LICENSE file for details.
+[MIT](LICENSE)
